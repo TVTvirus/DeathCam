@@ -16,7 +16,19 @@ log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
 # no renderizar mientras juegas (el render come GPU y la ventana roba foco).
 # gaturro-render-worker --force lo salta bajo tu responsabilidad.
-if [ "${1:-}" != "--force" ] && pgrep -f "instances/Mundo Gaturro" >/dev/null; then
+# OJO: exigimos que el proceso sea JAVA, no cualquier cosa con esa ruta en la
+# cmdline (p.ej. gwenview abriendo un screenshot de la carpeta = falso positivo
+# que atascaba la cola horas).
+mc_de_juego(){
+    local p
+    for p in $(pgrep -f "instances/Mundo Gaturro" 2>/dev/null); do
+        case "$(ps -o comm= -p "$p" 2>/dev/null)" in
+            java*|*[Mm]inecraft*) return 0 ;;
+        esac
+    done
+    return 1
+}
+if [ "${1:-}" != "--force" ] && mc_de_juego; then
     log "Minecraft de juego abierto: difiero el render (usa --force para obligar)."
     exit 0
 fi

@@ -57,12 +57,21 @@ public class EspermaRender implements ClientModInitializer {
         int bitrate = 4_000_000;
     }
 
-    private enum Phase { IDLE, WAIT_MENU, WAIT_REPLAY, WAIT_EXPORT, DONE }
+    private enum Phase { IDLE, WAIT_MENU, WAIT_REPLAY, SEEK, WAIT_EXPORT, DONE }
+
+    /** Ticks estables (level vivo, server quieto) que exigimos antes de exportar. */
+    private static final int STABLE_TICKS = 60;
+    /** Tope de reloj para llegar al export; si se pasa, marcamos failed y salimos. */
+    private static final long SETUP_TIMEOUT_MS = 8 * 60 * 1000L;
 
     private Job job;
     private Phase phase = Phase.IDLE;
     private int settleTicks = 0;
     private boolean exportStarted = false;
+    private int startTick = 0;
+    private int endTick = 0;
+    private long setupDeadline = 0L;
+    private volatile boolean markerWritten = false;
 
     @Override
     public void onInitializeClient() {
@@ -79,6 +88,17 @@ public class EspermaRender implements ClientModInitializer {
         }
         LOGGER.info("[espermarender] job cargado: replay={} follow={} -> {}", job.replay, job.follow, job.output);
         phase = Phase.WAIT_MENU;
+        setupDeadline = System.currentTimeMillis() + SETUP_TIMEOUT_MS;
+
+        // Red de seguridad: si el juego se muere por un crash de Flashback (o por
+        // lo que sea) sin haber escrito marcador, el worker se quedaria esperando
+        // el .status hasta su timeout. Dejamos "failed" escrito al salir.
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (!markerWritten) {
+                LOGGER.warn("[espermarender] saliendo sin marcador: escribo failed");
+                writeMarker("failed");
+            }
+        }, "espermarender-marker"));
 
         ClientTickEvents.END_CLIENT_TICK.register(mc -> {
             try {
@@ -110,10 +130,38 @@ public class EspermaRender implements ClientModInitializer {
                 }
             }
             case WAIT_REPLAY -> {
+                if (timedOut(mc)) return;
                 if (!Flashback.isInReplay()) return;
                 ReplayServer rs = Flashback.getReplayServer();
-                if (rs == null || rs.getTotalReplayTicks() <= 0 || mc.level == null) return;
-                if (++settleTicks < 100) return; // ~5s para que cargue mundo/chunks
+                if (rs == null || rs.getTotalReplayTicks() <= 0) return;
+                // El mundo del replay se carga por fases y el ClientLevel puede
+                // volver a null en medio: cualquier bache reinicia la cuenta.
+                if (!ready(mc, rs)) { settleTicks = 0; return; }
+                if (++settleTicks < STABLE_TICKS) return;
+
+                int total = rs.getTotalReplayTicks();
+                endTick = Math.max(1, total - 5);
+                startTick = Math.max(0, endTick - job.seconds * 20);
+
+                // Saltar al tick de inicio ANTES de exportar. En replays largos
+                // (>15k ticks) ese salto recarga el mundo entero; si lo hacia
+                // Flashback dentro de ExportJob.setup, pillaba mc.level == null
+                // y reventaba con NPE (dias 25 y 26 de julio de 2026).
+                LOGGER.info("[espermarender] replay listo ({} ticks), saltando a {}...", total, startTick);
+                rs.replayPaused = true;
+                rs.goToReplayTick(startTick);
+                settleTicks = 0;
+                phase = Phase.SEEK;
+            }
+            case SEEK -> {
+                if (timedOut(mc)) return;
+                ReplayServer rs = Flashback.getReplayServer();
+                if (rs == null) return;
+                // Esperar a que el salto termine y el mundo vuelva a estar entero.
+                boolean seeked = rs.getReplayTick() >= startTick && !rs.fastForwarding && !rs.isProcessingSnapshot;
+                if (!seeked || !ready(mc, rs)) { settleTicks = 0; return; }
+                if (++settleTicks < STABLE_TICKS) return;
+                LOGGER.info("[espermarender] mundo estable en tick {} tras el salto", rs.getReplayTick());
                 startExport(rs);
                 phase = Phase.WAIT_EXPORT;
             }
@@ -131,13 +179,25 @@ public class EspermaRender implements ClientModInitializer {
         }
     }
 
+    /** El replay esta de verdad navegable: server arrancado y cliente con mundo y jugador. */
+    private boolean ready(Minecraft mc, ReplayServer rs) {
+        return rs.isReady() && mc.level != null && mc.player != null && !rs.isProcessingSnapshot;
+    }
+
+    /** Si el mundo nunca llega a estar listo, morimos limpio en vez de colgar la cola. */
+    private boolean timedOut(Minecraft mc) {
+        if (System.currentTimeMillis() < setupDeadline) return false;
+        LOGGER.error("[espermarender] el replay no estuvo listo en {} min, abandono", SETUP_TIMEOUT_MS / 60000);
+        fail(mc);
+        return true;
+    }
+
     private void startExport(ReplayServer rs) {
         EditorState editorState = EditorStateManager.getCurrent();
         if (editorState == null) throw new IllegalStateException("sin EditorState");
 
-        int total = rs.getTotalReplayTicks();
-        int end = Math.max(1, total - 5);
-        int start = Math.max(0, end - job.seconds * 20);
+        int start = startTick;
+        int end = endTick;
 
         // Camara POV: pegada a la cabeza del muerto todo el clip
         long stamp = editorState.acquireWrite();
@@ -183,6 +243,7 @@ public class EspermaRender implements ClientModInitializer {
     private void writeMarker(String status) {
         try {
             Files.writeString(Path.of(job.output + ".status"), status);
+            markerWritten = true;
         } catch (Exception ignored) {}
     }
 
